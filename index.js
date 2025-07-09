@@ -40,7 +40,8 @@ db.serialize(() => {
 // Constants
 const COINGECKO_API = 'https://api.coingecko.com/api/v3';
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
-const RATE_LIMIT_DELAY = 1200; // 1.2 seconds
+const RATE_LIMIT_DELAY = 2000; // 2 seconds (increased from 1.2s)
+const MAX_RETRIES = 5; // Increased retries
 
 // Cache and state management
 const coinCache = new Map();
@@ -66,7 +67,7 @@ const getCoinData = async (coinId) => {
     }
 
     let retries = 0;
-    while (retries < 3) {
+    while (retries < MAX_RETRIES) {
         try {
             await delay(RATE_LIMIT_DELAY);
             const response = await axios.get(`${COINGECKO_API}/coins/${coinId}`, {
@@ -75,24 +76,33 @@ const getCoinData = async (coinId) => {
                     tickers: false,
                     community_data: false,
                     developer_data: false
-                }
+                },
+                timeout: 10000 // 10 second timeout
             });
 
             const data = response.data;
             coinCache.set(cacheKey, { data, timestamp: Date.now() });
             return data;
         } catch (error) {
+            retries++;
             if (error.response?.status === 429) {
-                retries++;
-                await delay(Math.pow(2, retries) * 1000);
+                // Rate limit hit - wait longer
+                const waitTime = Math.min(Math.pow(2, retries) * 2000, 30000); // Max 30 seconds
+                console.log(`Rate limit hit, waiting ${waitTime}ms before retry ${retries}/${MAX_RETRIES}`);
+                await delay(waitTime);
             } else if (error.response?.status === 404) {
                 throw new Error('Coin not found');
+            } else if (error.code === 'ECONNABORTED') {
+                console.log(`Request timeout, retry ${retries}/${MAX_RETRIES}`);
+                await delay(1000 * retries);
             } else {
-                throw error;
+                console.error(`API Error (attempt ${retries}):`, error.message);
+                if (retries === MAX_RETRIES) throw error;
+                await delay(1000 * retries);
             }
         }
     }
-    throw new Error('Rate limit exceeded');
+    throw new Error('Max retries exceeded - API temporarily unavailable');
 };
 
 const getTopCoins = async () => {
@@ -103,24 +113,38 @@ const getTopCoins = async () => {
         return cached.data;
     }
 
-    try {
-        await delay(RATE_LIMIT_DELAY);
-        const response = await axios.get(`${COINGECKO_API}/coins/markets`, {
-            params: {
-                vs_currency: 'usd',
-                order: 'market_cap_desc',
-                per_page: 10,
-                page: 1
-            }
-        });
+    let retries = 0;
+    while (retries < MAX_RETRIES) {
+        try {
+            await delay(RATE_LIMIT_DELAY);
+            const response = await axios.get(`${COINGECKO_API}/coins/markets`, {
+                params: {
+                    vs_currency: 'usd',
+                    order: 'market_cap_desc',
+                    per_page: 10,
+                    page: 1
+                },
+                timeout: 10000
+            });
 
-        const data = response.data;
-        coinCache.set(cacheKey, { data, timestamp: Date.now() });
-        return data;
-    } catch (error) {
-        console.error('Error fetching top coins:', error.message);
-        return [];
+            const data = response.data;
+            coinCache.set(cacheKey, { data, timestamp: Date.now() });
+            return data;
+        } catch (error) {
+            retries++;
+            if (error.response?.status === 429) {
+                const waitTime = Math.min(Math.pow(2, retries) * 2000, 30000);
+                console.log(`Rate limit hit for top coins, waiting ${waitTime}ms`);
+                await delay(waitTime);
+            } else {
+                console.error(`Error fetching top coins (attempt ${retries}):`, error.message);
+                if (retries === MAX_RETRIES) break;
+                await delay(1000 * retries);
+            }
+        }
     }
+    console.error('Failed to fetch top coins after max retries');
+    return [];
 };
 
 // Bot commands
@@ -167,7 +191,13 @@ ${coinData.links.whitepaper ? `Whitepaper: ${coinData.links.whitepaper}` : ''}`;
         bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
     } catch (error) {
         console.error('Error fetching coin data:', error.message);
-        bot.sendMessage(chatId, '❌ Error: Could not fetch coin data. Please check the coin symbol and try again.');
+        if (error.message.includes('Rate limit') || error.message.includes('Max retries')) {
+            bot.sendMessage(chatId, '⏱️ CoinGecko API is busy. Please try again in a few minutes.');
+        } else if (error.message === 'Coin not found') {
+            bot.sendMessage(chatId, '❌ Coin not found. Please check the symbol and try again.');
+        } else {
+            bot.sendMessage(chatId, '❌ Error fetching coin data. Please try again later.');
+        }
     }
 });
 
@@ -278,6 +308,19 @@ bot.onText(/\/addfav (.+)/, async (msg, match) => {
     const coinSymbol = match[1].toLowerCase().trim();
 
     try {
+        // First check if coin is already in favorites to avoid unnecessary API call
+        const existingFav = await new Promise((resolve, reject) => {
+            db.get('SELECT coin FROM favorites WHERE chat_id = ? AND coin = ?', [chatId, coinSymbol], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
+        });
+
+        if (existingFav) {
+            bot.sendMessage(chatId, `⭐ ${coinSymbol} is already in your favorites!`);
+            return;
+        }
+
         // Verify coin exists
         await getCoinData(coinSymbol);
         
@@ -292,7 +335,13 @@ bot.onText(/\/addfav (.+)/, async (msg, match) => {
             });
     } catch (error) {
         console.error('Error adding favorite:', error.message);
-        bot.sendMessage(chatId, '❌ Error: Could not find coin. Please check the symbol and try again.');
+        if (error.message.includes('Rate limit') || error.message.includes('Max retries')) {
+            bot.sendMessage(chatId, '⏱️ CoinGecko API is busy. Please try again in a few minutes.');
+        } else if (error.message === 'Coin not found') {
+            bot.sendMessage(chatId, '❌ Coin not found. Please check the symbol and try again.');
+        } else {
+            bot.sendMessage(chatId, '❌ Error adding to favorites. Please try again later.');
+        }
     }
 });
 
