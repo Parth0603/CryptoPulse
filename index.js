@@ -3,6 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
+const express = require('express');
 
 // Initialize bot
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -539,11 +540,100 @@ cron.schedule('*/2 * * * *', async () => {
 
 console.log('Bot is running...');
 
-// Error handling
+// Express app for health check and keeping service alive
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Health check endpoint
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'Crypto Bot is running!',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+// Ping endpoint for external monitoring
+app.get('/ping', (req, res) => {
+    res.json({ pong: true, time: Date.now() });
+});
+
+// Status endpoint
+app.get('/status', (req, res) => {
+    db.get('SELECT COUNT(*) as alertCount FROM alerts', [], (err, row) => {
+        if (err) {
+            res.status(500).json({ error: 'Database error' });
+            return;
+        }
+        
+        db.get('SELECT COUNT(*) as favCount FROM favorites', [], (err2, row2) => {
+            if (err2) {
+                res.status(500).json({ error: 'Database error' });
+                return;
+            }
+            
+            res.json({
+                status: 'healthy',
+                alerts: row.alertCount,
+                favorites: row2.favCount,
+                uptime: process.uptime(),
+                timestamp: new Date().toISOString()
+            });
+        });
+    });
+});
+
+// Start Express server
+app.listen(PORT, () => {
+    console.log(`Health check server running on port ${PORT}`);
+});
+
+// Keep-alive mechanism - ping self every 14 minutes to prevent sleeping
+if (process.env.NODE_ENV === 'production') {
+    const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `https://your-app-name.onrender.com`;
+    
+    setInterval(async () => {
+        try {
+            await axios.get(`${RENDER_URL}/ping`);
+            console.log('Keep-alive ping sent');
+        } catch (error) {
+            console.error('Keep-alive ping failed:', error.message);
+        }
+    }, 14 * 60 * 1000); // 14 minutes
+}
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    db.close((err) => {
+        if (err) {
+            console.error('Error closing database:', err.message);
+        } else {
+            console.log('Database connection closed.');
+        }
+        process.exit(0);
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT received, shutting down gracefully...');
+    db.close((err) => {
+        if (err) {
+            console.error('Error closing database:', err.message);
+        } else {
+            console.log('Database connection closed.');
+        }
+        process.exit(0);
+    });
+});
+
+// Error handling with better logging
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
+    // Don't exit process, just log the error
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    // Don't exit process, just log the error
 });
